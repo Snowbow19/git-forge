@@ -122,14 +122,69 @@ function decodeUntilFlush(buf: Buffer): { packets: Packet[]; rest: Buffer } {
   throw new Error('pkt-line stream has no flush');
 }
 
-/** Split pack bytes into sideband band-1 pkt-lines (≤ 65,520 bytes each). */
-function sidebandPackets(pack: Buffer): Buffer[] {
-  const out: Buffer[] = [];
-  const CHUNK = PKT_LINE_MAX - 4 - 1; // payload room minus the band byte
-  for (let off = 0; off < pack.length; off += CHUNK) {
-    const chunk = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+/**
+ * Frame a list of pkt-line payloads (strings written straight into the
+ * output, Buffers copied) into ONE Buffer with a single allocation — no
+ * per-line header Buffer and no concat. Raw markers (FLUSH/DELIM) are not
+ * payloads and must stay separate pieces in the response.
+ */
+function pktJoin(items: Array<string | Buffer>): Buffer {
+  let total = 0;
+  for (const item of items) total += 4 + (typeof item === 'string' ? Buffer.byteLength(item, 'utf8') : item.length);
+  const out = Buffer.alloc(total);
+  let off = 0;
+  for (const item of items) {
+    let len: number;
+    if (typeof item === 'string') {
+      len = out.write(item, off + 4, 'utf8');
+    } else {
+      item.copy(out, off + 4);
+      len = item.length;
+    }
+    out.write((len + 4).toString(16).padStart(4, '0'), off, 4, 'ascii');
+    off += 4 + len;
   }
+  return out;
+}
+
+/**
+ * The whole sideband band-1 section for a pack, in one Buffer: each chunk
+ * becomes one pkt-line whose payload is a 0x01 band byte + pack bytes.
+ * Identical bytes to the old per-chunk build.
+ */
+function sidebandSection(pack: Buffer): Buffer {
+  const CHUNK = PKT_LINE_MAX - 4 - 1; // payload room minus the band byte
+  let total = 0;
+  for (let off = 0; off < pack.length; off += CHUNK) total += 4 + 1 + Math.min(CHUNK, pack.length - off);
+  const out = Buffer.alloc(total);
+  let o = 0;
+  for (let off = 0; off < pack.length; off += CHUNK) {
+    const len = Math.min(CHUNK, pack.length - off);
+    out.write((len + 5).toString(16).padStart(4, '0'), o, 4, 'ascii');
+    out[o + 4] = 1;
+    pack.copy(out, o + 5, off, off + len);
+    o += 4 + 1 + len;
+  }
+  return out;
+}
+
+/**
+ * Frame pre-built pkt-lines (each already a complete pkt-line Buffer) as
+ * sideband band-1 packets, in one Buffer, then the stream-ending flush.
+ * Identical bytes to framing each line separately.
+ */
+function frameSideband(lines: Buffer[]): Buffer {
+  let total = 4; // trailing FLUSH
+  for (const line of lines) total += 4 + 1 + line.length;
+  const out = Buffer.alloc(total);
+  let o = 0;
+  for (const line of lines) {
+    out.write((line.length + 5).toString(16).padStart(4, '0'), o, 4, 'ascii');
+    out[o + 4] = 1;
+    line.copy(out, o + 5);
+    o += 4 + 1 + line.length;
+  }
+  out.write('0000', o, 4, 'ascii');
   return out;
 }
 
@@ -522,24 +577,22 @@ function peelOid(repo: Repo, refOid: string): string | undefined {
   return isOid(target) ? target : undefined;
 }
 
+/** The v0 advertisement: one Buffer, built from two single-alloc sections. */
 function v0Advertisement(repo: Repo, service: string, caps: string): Buffer {
-  const parts: Buffer[] = [];
-  parts.push(pktLine(`# service=${service}\n`));
-  parts.push(FLUSH);
+  const refLines: string[] = [];
   const refs = sortedRefs(repo);
   if (refs.length === 0) {
-    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    refLines.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
     const mainTip = repo.refs.get(MAIN_REF) ?? ZERO_OID;
-    parts.push(pktLine(`${mainTip} HEAD\0${caps}\n`));
+    refLines.push(`${mainTip} HEAD\0${caps}\n`);
     for (const [ref, oid] of refs) {
-      parts.push(pktLine(`${oid} ${ref}\n`));
+      refLines.push(`${oid} ${ref}\n`);
       const peeled = peelOid(repo, oid);
-      if (peeled !== undefined) parts.push(pktLine(`${peeled} ${ref}^{}\n`));
+      if (peeled !== undefined) refLines.push(`${peeled} ${ref}^{}\n`);
     }
   }
-  parts.push(FLUSH);
-  return Buffer.concat(parts);
+  return Buffer.concat([pktJoin([`# service=${service}\n`]), FLUSH, pktJoin(refLines), FLUSH]);
 }
 
 /** The v2 capability advertisement never changes: build its bytes once and reuse them. */
@@ -776,13 +829,13 @@ function handleLsRefs(repo: Repo, packets: Packet[]): Buffer {
   }
   const matches = (name: string): boolean =>
     prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
-  const out: Buffer[] = [];
+  const lines: string[] = [];
   const mainTip = repo.refs.get(MAIN_REF);
   if (matches('HEAD')) {
     if (mainTip !== undefined) {
-      out.push(pktLine(`${mainTip} HEAD${symrefs ? ' symref-target:refs/heads/main' : ''}\n`));
+      lines.push(`${mainTip} HEAD${symrefs ? ' symref-target:refs/heads/main' : ''}\n`);
     } else if (unborn) {
-      out.push(pktLine(`unborn HEAD${symrefs ? ' symref-target:refs/heads/main' : ''}\n`));
+      lines.push(`unborn HEAD${symrefs ? ' symref-target:refs/heads/main' : ''}\n`);
     }
   }
   for (const [ref, oid] of sortedRefs(repo)) {
@@ -792,10 +845,9 @@ function handleLsRefs(repo: Repo, packets: Packet[]): Buffer {
       const peeled = peelOid(repo, oid);
       if (peeled !== undefined) line += ` peeled:${peeled}`;
     }
-    out.push(pktLine(`${line}\n`));
+    lines.push(`${line}\n`);
   }
-  out.push(FLUSH);
-  return Buffer.concat(out);
+  return Buffer.concat([pktJoin(lines), FLUSH]);
 }
 
 function parseFetchArgs(packets: Packet[]): {
@@ -864,30 +916,34 @@ function handleFetchV2(repo: Repo, packets: Packet[]): Buffer {
   // the packfile section — sending an acknowledgments section there makes
   // git die with "expected 'packfile', received 'acknowledgments'".
   if (args.haves.length > 0 && !args.done) {
-    parts.push(pktLine('acknowledgments\n'));
+    const ackLines: string[] = ['acknowledgments\n'];
     if (selection.acks.length > 0) {
-      for (const ack of selection.acks) parts.push(pktLine(`ACK ${ack}\n`));
+      for (const ack of selection.acks) ackLines.push(`ACK ${ack}\n`);
     } else {
-      parts.push(pktLine('NAK\n'));
+      ackLines.push('NAK\n');
     }
+    ackLines.push('ready\n');
+    parts.push(pktJoin(ackLines));
     // "ready" + delim tells git the pack follows in this same response
     // (without it, git waits for a response-end packet and opens a new
     // negotiation round).
-    parts.push(pktLine('ready\n'));
     parts.push(DELIM);
   }
   if (args.depth !== undefined && (selection.shallow.length > 0 || selection.unshallow.length > 0)) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of selection.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+    const shallowLines: string[] = ['shallow-info\n'];
+    for (const oid of selection.shallow) shallowLines.push(`shallow ${oid}\n`);
+    for (const oid of selection.unshallow) shallowLines.push(`unshallow ${oid}\n`);
+    parts.push(pktJoin(shallowLines));
     parts.push(FLUSH);
   }
   // The packfile section is always sent (an empty pack when nothing is owed):
   // git's fetch requires the section after the acknowledgments/shallow-info,
   // and the suite accepts an empty pack for a nothing-new fetch.
-  parts.push(pktLine('packfile\n'));
-  for (const packet of sidebandPackets(writePack(repo, selection.objects))) parts.push(packet);
+  parts.push(pktJoin(['packfile\n']));
+  parts.push(sidebandSection(writePack(repo, selection.objects)));
   parts.push(FLUSH);
+  // One concat here, once per distinct fetch: the cached value is a single
+  // Buffer, so every repeat (the 50 concurrent clones) is one write.
   const response = Buffer.concat(parts);
   if (repo.fetchCache.size >= 128) repo.fetchCache.clear();
   repo.fetchCache.set(cacheKey, response);
@@ -934,15 +990,17 @@ function handleFetchV0(repo: Repo, packets: Packet[]): Buffer {
   }
   const selection = computeFetch(repo, wants, haves, shallow, depth, deepenRelative);
   const parts: Buffer[] = [];
+  const ackLines: string[] = [];
   if (selection.acks.length > 0) {
-    for (const ack of selection.acks) parts.push(pktLine(`ACK ${ack}\n`));
+    for (const ack of selection.acks) ackLines.push(`ACK ${ack}\n`);
   } else {
-    parts.push(pktLine('NAK\n'));
+    ackLines.push('NAK\n');
   }
-  for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-  for (const oid of selection.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+  for (const oid of selection.shallow) ackLines.push(`shallow ${oid}\n`);
+  for (const oid of selection.unshallow) ackLines.push(`unshallow ${oid}\n`);
+  parts.push(pktJoin(ackLines));
   if (selection.objects.size > 0) {
-    for (const packet of sidebandPackets(writePack(repo, selection.objects))) parts.push(packet);
+    parts.push(sidebandSection(writePack(repo, selection.objects)));
   }
   parts.push(FLUSH);
   return Buffer.concat(parts);
@@ -1068,9 +1126,9 @@ function handleReceivePack(ctx: Ctx, store: Store, repo: Repo): Resp {
     for (const command of commands) results.push(applyCommand(store, repo, command));
   }
 
-  const lines: Buffer[] = [pktLine(`unpack ${unpackOk ? 'ok' : unpackDetail}\n`)];
+  const lines: string[] = [`unpack ${unpackOk ? 'ok' : unpackDetail}\n`];
   for (const result of results) {
-    lines.push(pktLine(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`));
+    lines.push(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`);
   }
   let response: Buffer;
   if (sideband) {
@@ -1079,11 +1137,9 @@ function handleReceivePack(ctx: Ctx, store: Store, repo: Repo): Resp {
     // "the remote end hung up unexpectedly" if the pipe closes after the
     // last report line without one. The bare flush after the banded packets
     // ends the sideband stream itself.
-    const innerLines = [...lines, FLUSH];
-    const framed = innerLines.map((line) => pktLine(Buffer.concat([Buffer.from([1]), line])));
-    response = Buffer.concat([...framed, FLUSH]);
+    response = frameSideband([pktJoin(lines), FLUSH]);
   } else {
-    response = Buffer.concat([...lines, FLUSH]);
+    response = Buffer.concat([pktJoin(lines), FLUSH]);
   }
   return { status: 200, raw: response, headers: { 'content-type': 'application/x-git-receive-pack-result' } };
 }

@@ -207,7 +207,9 @@ const REASONS: Record<number, string> = {
 /**
  * Serialize a handler's Resp into a single Buffer (status line + headers +
  * body) and the request id it carries. One write per response, no header
- * object, no stream machinery.
+ * object, no stream machinery. (A parts/cork variant was tried and reverted:
+ * several socket.write calls per response cost more than one concat under
+ * the clone workload's 50 concurrent sockets.)
  */
 function buildResponse(result: Resp): Buffer {
   requestCounter += 1;
@@ -370,8 +372,13 @@ function parseRequest(buf: Buffer, start: number, continueSent: boolean): ParseO
  * Answer one parsed request against the router. Order: /healthz (no auth)
  * -> Bearer auth for /api/v3 -> malformed JSON is 400 -> route or JSON 404.
  * Every reply carries X-GitHub-Request-Id.
+/**
+ * Route one request to its handler and serialize the response. Returns the
+ * response Buffer synchronously when the handler is synchronous (all of
+ * them are today) — no promise, no microtask — and a promise only when a
+ * handler returns one.
  */
-async function dispatch(req: ParsedRequest, store: Store, router: Router): Promise<Buffer> {
+function dispatch(req: ParsedRequest, store: Store, router: Router): Buffer | Promise<Buffer> {
   const method = req.method;
   const rawUrl = req.target;
   const qIndex = rawUrl.indexOf('?');
@@ -413,11 +420,10 @@ async function dispatch(req: ParsedRequest, store: Store, router: Router): Promi
     return buildErrorResponse(err);
   }
   if (result instanceof Promise) {
-    try {
-      return buildResponse(await result);
-    } catch (err) {
-      return buildErrorResponse(err);
-    }
+    return result.then(
+      (r) => buildResponse(r),
+      (err) => buildErrorResponse(err),
+    );
   }
   return buildResponse(result);
 }
@@ -470,7 +476,8 @@ function handleSocket(socket: Socket, store: Store, router: Router): void {
         }
         const { req, next } = parsed;
         continueSent = false;
-        const response = await dispatch(req, store, router);
+        const dispatched = dispatch(req, store, router);
+        const response = dispatched instanceof Promise ? await dispatched : dispatched;
         buf = buf.subarray(next);
         if (closed) return;
         socket.write(response);
