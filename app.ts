@@ -6,6 +6,7 @@
 
 import type { Server } from 'node:http';
 import { createHttpServer, Router } from './http.ts';
+import { registerGitRoutes } from './git.ts';
 import { registerRestRoutes } from './rest.ts';
 import { Store } from './store.ts';
 
@@ -14,5 +15,6 @@ export function createApp(): Server {
   const store = new Store();
   const router = new Router();
   registerRestRoutes(router);
+  registerGitRoutes(router);
   return createHttpServer(store, router);
 }

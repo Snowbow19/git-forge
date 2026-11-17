@@ -18,6 +18,8 @@ export interface Ctx {
   headers: IncomingMessage['headers'];
   /** Parsed JSON body, or undefined when there is no body. */
   body: unknown;
+  /** The request body exactly as received (binary-safe); git handlers read this. */
+  rawBody: Buffer;
   /** Route params captured from the pattern. */
   params: Record<string, string>;
   /** Origin of this request, e.g. `http://127.0.0.1:1234` (for absolute Link URLs). */
@@ -28,6 +30,8 @@ export interface Resp {
   status: number;
   /** Omitted for 204. */
   body?: unknown;
+  /** Raw binary body (git smart-HTTP); when set, `body` is ignored and no JSON is emitted. */
+  raw?: Buffer;
   headers?: Record<string, string>;
 }
 
@@ -97,12 +101,12 @@ export function isAuthenticated(req: IncomingMessage): boolean {
   return true;
 }
 
-/** Read the whole request body as text (drains the stream even when the caller ignores it). */
-function readBody(req: IncomingMessage): Promise<string> {
+/** Read the whole request body as bytes (drains the stream even when the caller ignores it). */
+function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -140,6 +144,17 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
     ...headers,
   });
   res.end(text);
+}
+
+function sendRaw(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
+  requestCounter += 1;
+  const requestId = `req-${requestCounter}`;
+  res.writeHead(status, {
+    'content-length': body.length,
+    'x-github-request-id': requestId,
+    ...headers,
+  });
+  res.end(body);
 }
 
 function errJson(status: number, message: string): Resp {
@@ -182,9 +197,11 @@ export function createRequestHandler(store: Store, router: Router): (req: Incomi
         }
 
         let body: unknown;
-        if (rawBody.trim() !== '') {
+        // JSON is only parsed for the REST API; git smart-HTTP bodies are
+        // binary pkt-line/pack streams and reach their handlers via rawBody.
+        if (underApi && rawBody.length > 0) {
           try {
-            body = JSON.parse(rawBody) as unknown;
+            body = JSON.parse(rawBody.toString('utf8')) as unknown;
           } catch {
             sendJson(res, 400, { message: 'Invalid JSON in request body' });
             return;
@@ -196,9 +213,11 @@ export function createRequestHandler(store: Store, router: Router): (req: Incomi
           sendJson(res, 404, { message: 'Not Found' });
           return;
         }
-        const ctx: Ctx = { method, segments, query, headers: req.headers, body, params: matched.params, origin };
+        const ctx: Ctx = { method, segments, query, headers: req.headers, body, rawBody, params: matched.params, origin };
         const result = await matched.handler(ctx, store);
-        if (result.body === undefined && result.status !== 204) {
+        if (result.raw !== undefined) {
+          sendRaw(res, result.status, result.raw, result.headers);
+        } else if (result.body === undefined && result.status !== 204) {
           sendJson(res, result.status, {}, result.headers);
         } else {
           sendJson(res, result.status, result.body, result.headers);
