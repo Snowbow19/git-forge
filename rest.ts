@@ -302,6 +302,26 @@ export function registerRestRoutes(router: Router): void {
     return { status: 200, body: branches };
   });
 
+  router.add('GET', '/api/v3/repos/:owner/:repo/branches/:branch', (ctx, store) => {
+    const repo = requireRepo(ctx, store);
+    if ('status' in repo) return repo;
+    const branch = ctx.params.branch ?? '';
+    const ref = refName(branch);
+    const sha = repo.refs.get(ref);
+    if (sha === undefined) return notFound('Branch');
+    return { status: 200, body: { name: branch, commit: { sha }, protected: false } };
+  });
+
+  router.add('GET', '/api/v3/repos/:owner/:repo/git/refs/*ref', (ctx, store) => {
+    const repo = requireRepo(ctx, store);
+    if ('status' in repo) return repo;
+    const ref = ctx.params.ref ?? '';
+    const fullRef = ref.startsWith('refs/') ? ref : `refs/${ref}`;
+    const sha = repo.refs.get(fullRef);
+    if (sha === undefined) return notFound('Ref');
+    return { status: 200, body: { ref: fullRef, object: { sha, type: 'commit' } } };
+  });
+
   router.add('POST', '/api/v3/repos/:owner/:repo/git/refs', (ctx, store) => {
     const repo = requireRepo(ctx, store);
     if ('status' in repo) return repo;

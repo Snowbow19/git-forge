@@ -7,6 +7,8 @@
 import type { Server } from 'node:http';
 import { createHttpServer, Router } from './http.ts';
 import { registerGitRoutes } from './git.ts';
+import { registerGraphqlRoutes } from './graphql.ts';
+import { registerMcpRoutes } from './mcp.ts';
 import { registerRestRoutes } from './rest.ts';
 import { Store } from './store.ts';
 
@@ -16,5 +18,7 @@ export function createApp(): Server {
   const router = new Router();
   registerRestRoutes(router);
   registerGitRoutes(router);
+  registerGraphqlRoutes(router);
+  registerMcpRoutes(router);
   return createHttpServer(store, router);
 }
