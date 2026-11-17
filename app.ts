@@ -4,7 +4,7 @@
 // GET /healthz -> 200 {"ok": true} (no auth), GET /api/v3/ -> 200 JSON with
 // X-OAuth-Scopes; everything else is routed through rest.ts.
 
-import type { Server } from 'node:http';
+import type { Server } from 'node:net';
 import { createHttpServer, Router } from './http.ts';
 import { registerGitRoutes } from './git.ts';
 import { registerGraphqlRoutes } from './graphql.ts';

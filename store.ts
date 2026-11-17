@@ -51,9 +51,9 @@ export function gitObjectBytes(type: string, body: Buffer): Buffer {
   return Buffer.concat([Buffer.from(`${type} ${body.length}\0`, 'utf8'), body]);
 }
 
-/** The git object id: SHA-1 of the framed object. */
+/** The git object id: SHA-1 of the framed object (hashed incrementally: no copy of the body). */
 export function gitObjectSha(type: string, body: Buffer): string {
-  return sha1Hex(gitObjectBytes(type, body));
+  return createHash('sha1').update(`${type} ${body.length}\0`, 'utf8').update(body).digest('hex');
 }
 
 export type ObjectType = 'blob' | 'tree' | 'commit' | 'tag';

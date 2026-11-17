@@ -542,16 +542,19 @@ function v0Advertisement(repo: Repo, service: string, caps: string): Buffer {
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement never changes: build its bytes once and reuse them. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  FLUSH,
+  pktLine('version 2\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    FLUSH,
-    pktLine('version 2\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('object-format=sha1\n'),
-    FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 // -- fetch object selection --------------------------------------------------

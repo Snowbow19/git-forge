@@ -20,7 +20,7 @@
 // fails is retried with backoff; only a plain contract error (400/405 on
 // register) ends the program early.
 
-import type { Server } from 'node:http';
+import type { Server } from 'node:net';
 import { createApp } from './app.ts';
 
 /** The env origin, with trailing slashes trimmed off. Empty when unset. */

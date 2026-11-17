@@ -1,8 +1,24 @@
 // HTTP plumbing: router, JSON body parsing, Bearer auth, and the reply
 // envelope (JSON content type + deterministic per-request X-GitHub-Request-Id
 // on every reply). No business logic lives here; rest.ts registers routes.
+//
+// Transport: a raw node:net server with a hand-rolled HTTP/1.1 parser.
+// Node's http module spends most of a hot request's server time in its own
+// machinery (parser, IncomingMessage/ServerResponse allocation, header
+// handling, one write per head/body piece) while our handlers are a few
+// microseconds of Map lookups and a cached Buffer. The bench drives
+// thousands of small sequential requests on keep-alive connections, so the
+// per-request overhead is the whole game: one pre-built response Buffer
+// per request, written to the socket in a single write, with no per-request
+// object graph beyond the request's own headers and body.
+//
+// The wire contract is unchanged: the same status lines, headers, bodies
+// and keep-alive behaviour a Node http server would produce, so clients
+// (undici, git) cannot tell the difference. Requests are handled strictly
+// in order on each connection; pipelined bytes are parsed after the current
+// response is written.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createNetServer, type Server, type Socket } from 'node:net';
 import type { Store } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -15,7 +31,8 @@ export interface Ctx {
   /** Decoded path segments (no leading/trailing empties). */
   segments: string[];
   query: URLSearchParams;
-  headers: IncomingMessage['headers'];
+  /** Lower-cased header names, single values (first wins on duplicates). */
+  headers: Record<string, string | string[] | undefined>;
   /** Parsed JSON body, or undefined when there is no body. */
   body: unknown;
   /** The request body exactly as received (binary-safe); git handlers read this. */
@@ -101,35 +118,28 @@ function decodeSegment(segment: string): string {
 /**
  * Bearer check. When MAKEFUN_SHOP_TOKEN is set the token must match it
  * exactly; when unset, any non-empty Bearer token is accepted (local dev).
- * /healthz is exempt and handled before this is consulted.
+ * /healthz is exempt and handled before this is consulted. The expected
+ * token is read once at startup: process.env is consulted on every call
+ * otherwise, and the bench's read workload pays it 2,000 times a round.
  */
-export function isAuthenticated(req: IncomingMessage): boolean {
-  const header = req.headers.authorization ?? '';
+const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
+export function isAuthenticated(headers: Record<string, string | string[] | undefined>): boolean {
+  const raw = headers.authorization;
+  const header = typeof raw === 'string' ? raw : Array.isArray(raw) ? (raw[0] ?? '') : '';
   // Fast path: the suite always sends exactly `Bearer <token>`.
   if (header.startsWith('Bearer ')) {
     const token = header.slice(7).trim();
     if (token === '') return false;
-    const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-    if (expected !== '') return token === expected;
+    if (EXPECTED_TOKEN !== '') return token === EXPECTED_TOKEN;
     return true;
   }
   const match = /^Bearer\s+(.+)$/.exec(header);
   if (match === null) return false;
   const token = match[1]!.trim();
   if (token === '') return false;
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  if (expected !== '') return token === expected;
+  if (EXPECTED_TOKEN !== '') return token === EXPECTED_TOKEN;
   return true;
-}
-
-/** Read the whole request body as bytes (drains the stream even when the caller ignores it). */
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
 }
 
 export class Router {
@@ -166,47 +176,6 @@ export class Router {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  requestCounter += 1;
-  const requestId = `req-${requestCounter}`;
-  if (status === 204) {
-    res.writeHead(204, { 'x-github-request-id': requestId, ...headers });
-    res.end();
-    return;
-  }
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': requestId,
-    ...headers,
-  });
-  res.end(text);
-}
-
-function sendJsonBuf(res: ServerResponse, status: number, buf: Buffer, headers: Record<string, string> = {}): void {
-  requestCounter += 1;
-  const requestId = `req-${requestCounter}`;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': buf.length,
-    'x-github-request-id': requestId,
-    ...headers,
-  });
-  res.end(buf);
-}
-
-function sendRaw(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
-  requestCounter += 1;
-  const requestId = `req-${requestCounter}`;
-  res.writeHead(status, {
-    'content-length': body.length,
-    'x-github-request-id': requestId,
-    ...headers,
-  });
-  res.end(body);
-}
-
 function errJson(status: number, message: string): Resp {
   return { status, body: { message } };
 }
@@ -217,115 +186,323 @@ const EMPTY_QUERY = new URLSearchParams();
 /** An empty request body, reused whenever a request provably carries none. */
 const EMPTY_BODY = Buffer.alloc(0);
 
+/** Largest request body accepted (the biggest legit pack is far smaller); larger bodies close the socket. */
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
+/** Largest request head accepted; larger heads close the socket. */
+const MAX_HEAD_BYTES = 64 * 1024;
+
+const REASONS: Record<number, string> = {
+  200: 'OK',
+  201: 'Created',
+  204: 'No Content',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  404: 'Not Found',
+  405: 'Method Not Allowed',
+  409: 'Conflict',
+  422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
+
 /**
- * Send a handler's Resp. Synchronous handlers answer without an extra
- * microtask hop; async ones (none of the hot paths) go through the promise.
+ * Serialize a handler's Resp into a single Buffer (status line + headers +
+ * body) and the request id it carries. One write per response, no header
+ * object, no stream machinery.
  */
-function sendResp(res: ServerResponse, result: Resp): void {
+function buildResponse(result: Resp): Buffer {
+  requestCounter += 1;
+  const requestId = `req-${requestCounter}`;
+  const status = result.status;
+  const reason = REASONS[status] ?? 'OK';
+  let body: Buffer;
+  let contentType: string | undefined;
   if (result.raw !== undefined) {
-    sendRaw(res, result.status, result.raw, result.headers);
+    body = result.raw;
   } else if (result.jsonBuf !== undefined) {
-    sendJsonBuf(res, result.status, result.jsonBuf, result.headers);
-  } else if (result.body === undefined && result.status !== 204) {
-    sendJson(res, result.status, {}, result.headers);
+    body = result.jsonBuf;
+    contentType = JSON_TYPE;
+  } else if (result.body === undefined && status !== 204) {
+    body = Buffer.from('{}\n', 'utf8');
+    contentType = JSON_TYPE;
+  } else if (status === 204) {
+    body = EMPTY_BODY;
   } else {
-    sendJson(res, result.status, result.body, result.headers);
+    body = Buffer.from(`${JSON.stringify(result.body)}\n`, 'utf8');
+    contentType = JSON_TYPE;
   }
+  const headers = result.headers ?? {};
+  let head = `HTTP/1.1 ${status} ${reason}\r\n`;
+  if (contentType !== undefined) head += `content-type: ${contentType}\r\n`;
+  if (status !== 204) head += `content-length: ${body.length}\r\n`;
+  head += `x-github-request-id: ${requestId}\r\n`;
+  for (const name of Object.keys(headers)) head += `${name}: ${headers[name]}\r\n`;
+  head += '\r\n';
+  return body.length === 0 ? Buffer.from(head, 'utf8') : Buffer.concat([Buffer.from(head, 'utf8'), body]);
 }
 
-function sendErr(res: ServerResponse, err: unknown): void {
+/** The 500 a handler error answers with (logged, like the old transport). */
+function buildErrorResponse(err: unknown): Buffer {
   process.stderr.write(`[http] handler error: ${err instanceof Error ? err.message : String(err)}\n`);
-  try {
-    sendJson(res, 500, { message: 'Internal Server Error' });
-  } catch {
-    // The socket is already gone; nothing more to do.
-  }
+  return buildResponse({ status: 500, body: { message: 'Internal Server Error' } });
+}
+
+// -- request parsing ----------------------------------------------------------
+
+interface ParsedRequest {
+  method: string;
+  target: string;
+  http11: boolean;
+  headers: Record<string, string | undefined>;
+  body: Buffer;
+  /** False when the client asked to close (or HTTP/1.0 without keep-alive). */
+  keepAlive: boolean;
+}
+
+type ParseOutcome =
+  | { kind: 'need-more' }
+  | { kind: 'continue' }
+  | { kind: 'error'; message: string }
+  | { kind: 'request'; req: ParsedRequest; next: number };
+
+/** Find the end of the header block (`\r\n\r\n`) at or after `start`, or -1. */
+function findHeadEnd(buf: Buffer, start: number): number {
+  // Buffer.indexOf handles the scan; the needle is 4 bytes.
+  return buf.indexOf('\r\n\r\n', start);
 }
 
 /**
- * Build the request handler for a store + router. Order: /healthz (no auth)
- * -> drain body -> Bearer auth for /api/v3 -> malformed JSON is 400 -> route
- * or JSON 404. Every reply carries X-GitHub-Request-Id.
+ * Parse one request from `buf` starting at `start`. Returns the request and
+ * the offset just past its body, `need-more` when the bytes are not all
+ * here yet, `continue` when the head is parsed but the client is waiting
+ * for a 100 Continue before sending the body (answered once by the caller),
+ * or `error` when the bytes are not HTTP at all. A parsed request may be
+ * preceded in the same buffer by pipelined bytes, which the caller parses
+ * next.
  */
-export function createRequestHandler(store: Store, router: Router): (req: IncomingMessage, res: ServerResponse) => void {
-  return (req: IncomingMessage, res: ServerResponse): void => {
-    const method = req.method ?? 'GET';
-    // Fast path over `new URL(...)`: split the raw target on '?' and parse
-    // the query string only when one is present (bench traffic has none).
-    const rawUrl = req.url ?? '/';
-    const qIndex = rawUrl.indexOf('?');
-    const pathname = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
-    const query = qIndex === -1 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIndex + 1));
-    const segments = pathname.split('/').filter((part) => part !== '').map(decodeSegment);
-    const host = req.headers.host ?? '127.0.0.1';
-    const origin = `http://${host}`;
-
-    if (method === 'GET' && segments.length === 1 && segments[0] === 'healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
+function parseRequest(buf: Buffer, start: number, continueSent: boolean): ParseOutcome {
+  const headEnd = findHeadEnd(buf, start);
+  if (headEnd === -1) {
+    if (buf.length - start > MAX_HEAD_BYTES) return { kind: 'error', message: 'request head too large' };
+    return { kind: 'need-more' };
+  }
+  const head = buf.subarray(start, headEnd).toString('latin1');
+  const firstLineEnd = head.indexOf('\r\n');
+  const requestLine = firstLineEnd === -1 ? head : head.slice(0, firstLineEnd);
+  const parts = requestLine.split(' ');
+  if (parts.length !== 3) return { kind: 'error', message: 'bad request line' };
+  const method = parts[0]!;
+  const target = parts[1]!;
+  const version = parts[2]!;
+  if (method === '' || !target.startsWith('/') || (version !== 'HTTP/1.1' && version !== 'HTTP/1.0')) {
+    return { kind: 'error', message: 'bad request line' };
+  }
+  const http11 = version === 'HTTP/1.1';
+  const headers: Record<string, string | undefined> = {};
+  if (firstLineEnd !== -1) {
+    const lines = head.slice(firstLineEnd + 2).split('\r\n');
+    for (const line of lines) {
+      if (line === '') continue;
+      const colon = line.indexOf(':');
+      if (colon <= 0) return { kind: 'error', message: 'bad header line' };
+      const name = line.slice(0, colon).trim().toLowerCase();
+      const value = line.slice(colon + 1).trim();
+      if (headers[name] === undefined) headers[name] = value;
     }
-
-    // A request with no Content-Length (or 0) and no chunked encoding has
-    // no body: do not attach stream listeners and wait for 'end' — answer
-    // from the headers alone. (GETs in the suite never carry a body.)
-    const maybeBody =
-      req.headers['transfer-encoding'] !== undefined ||
-      (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0');
-    const bodyPromise = maybeBody ? readBody(req) : Promise.resolve(EMPTY_BODY);
-    void bodyPromise.then(
-      (rawBody) => {
-        try {
-        const underApi = segments.length >= 2 && segments[0] === 'api' && segments[1] === 'v3';
-        if (underApi && !isAuthenticated(req)) {
-          sendJson(res, 401, { message: 'Requires authentication' });
-          return;
-        }
-
-        let body: unknown;
-        // JSON is only parsed for the REST API; git smart-HTTP bodies are
-        // binary pkt-line/pack streams and reach their handlers via rawBody.
-        if (underApi && rawBody.length > 0) {
-          try {
-            body = JSON.parse(rawBody.toString('utf8')) as unknown;
-          } catch {
-            sendJson(res, 400, { message: 'Invalid JSON in request body' });
-            return;
+  }
+  const connection = (headers.connection ?? '').toLowerCase();
+  const keepAlive = http11 ? connection !== 'close' : connection === 'keep-alive';
+  const bodyStart = headEnd + 4;
+  // A client that sends `Expect: 100-continue` holds its body until we
+  // answer 100 Continue; without the answer the body never arrives. The
+  // caller writes the interim response once and re-parses with continueSent.
+  const wantsContinue = (headers.expect ?? '').toLowerCase() === '100-continue' && !continueSent;
+  const needMore = (): ParseOutcome => (wantsContinue ? { kind: 'continue' } : { kind: 'need-more' });
+  const transferEncoding = (headers['transfer-encoding'] ?? '').toLowerCase();
+  if (transferEncoding.includes('chunked')) {
+    // Chunked body: size lines (hex, extensions ignored), data, CRLF, until a 0 chunk + trailers.
+    let off = bodyStart;
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const lineEnd = buf.indexOf('\r\n', off);
+      if (lineEnd === -1) return needMore();
+      const sizeText = buf.subarray(off, lineEnd).toString('latin1').split(';')[0]!.trim();
+      const size = Number.parseInt(sizeText, 16);
+      if (!Number.isFinite(size) || size < 0) return { kind: 'error', message: 'bad chunk size' };
+      off = lineEnd + 2;
+      if (size === 0) {
+        // Trailers end at the first empty line.
+        for (;;) {
+          const trailerEnd = buf.indexOf('\r\n', off);
+          if (trailerEnd === -1) return needMore();
+          if (trailerEnd === off) {
+            off += 2;
+            break;
           }
+          off = trailerEnd + 2;
         }
-
-        const matched = router.match(method, segments);
-        if (matched === null) {
-          sendJson(res, 404, { message: 'Not Found' });
-          return;
-        }
-        const ctx: Ctx = { method, segments, query, headers: req.headers, body, rawBody, params: matched.params, origin };
-        let result: Resp | Promise<Resp>;
-        try {
-          result = matched.handler(ctx, store);
-        } catch (err) {
-          sendErr(res, err);
-          return;
-        }
-        if (result instanceof Promise) {
-          result.then(
-            (resolved) => sendResp(res, resolved),
-            (err: unknown) => sendErr(res, err),
-          );
-        } else {
-          sendResp(res, result);
-        }
-      } catch (err) {
-        sendErr(res, err);
+        const body = total === 0 ? EMPTY_BODY : Buffer.concat(chunks, total);
+        return { kind: 'request', req: { method, target, http11, headers, body, keepAlive }, next: off };
       }
-      },
-      (err: unknown) => sendErr(res, err),
-    );
-  };
+      if (off + size + 2 > buf.length) return needMore();
+      total += size;
+      if (total > MAX_BODY_BYTES) return { kind: 'error', message: 'request body too large' };
+      chunks.push(buf.subarray(off, off + size));
+      off += size + 2;
+    }
+  }
+  const lengthRaw = headers['content-length'];
+  if (lengthRaw !== undefined) {
+    const length = Number(lengthRaw);
+    if (!Number.isInteger(length) || length < 0) return { kind: 'error', message: 'bad content-length' };
+    if (length > MAX_BODY_BYTES) return { kind: 'error', message: 'request body too large' };
+    if (bodyStart + length > buf.length) return needMore();
+    const body = length === 0 ? EMPTY_BODY : buf.subarray(bodyStart, bodyStart + length);
+    return { kind: 'request', req: { method, target, http11, headers, body, keepAlive }, next: bodyStart + length };
+  }
+  // No body framing: a request with no body at all.
+  return { kind: 'request', req: { method, target, http11, headers, body: EMPTY_BODY, keepAlive }, next: bodyStart };
 }
 
-/** Build an http.Server from a store + router. */
+// -- dispatch (same rules as the old transport) -------------------------------
+
+/**
+ * Answer one parsed request against the router. Order: /healthz (no auth)
+ * -> Bearer auth for /api/v3 -> malformed JSON is 400 -> route or JSON 404.
+ * Every reply carries X-GitHub-Request-Id.
+ */
+async function dispatch(req: ParsedRequest, store: Store, router: Router): Promise<Buffer> {
+  const method = req.method;
+  const rawUrl = req.target;
+  const qIndex = rawUrl.indexOf('?');
+  const pathname = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
+  const query = qIndex === -1 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIndex + 1));
+  const segments = pathname.split('/').filter((part) => part !== '').map(decodeSegment);
+  const host = req.headers.host ?? '127.0.0.1';
+  const origin = `http://${host}`;
+
+  if (method === 'GET' && segments.length === 1 && segments[0] === 'healthz') {
+    return buildResponse({ status: 200, body: { ok: true } });
+  }
+
+  const underApi = segments.length >= 2 && segments[0] === 'api' && segments[1] === 'v3';
+  if (underApi && !isAuthenticated(req.headers)) {
+    return buildResponse({ status: 401, body: { message: 'Requires authentication' } });
+  }
+
+  let body: unknown;
+  // JSON is only parsed for the REST API; git smart-HTTP bodies are binary
+  // pkt-line/pack streams and reach their handlers via rawBody.
+  if (underApi && req.body.length > 0) {
+    try {
+      body = JSON.parse(req.body.toString('utf8')) as unknown;
+    } catch {
+      return buildResponse({ status: 400, body: { message: 'Invalid JSON in request body' } });
+    }
+  }
+
+  const matched = router.match(method, segments);
+  if (matched === null) {
+    return buildResponse({ status: 404, body: { message: 'Not Found' } });
+  }
+  const ctx: Ctx = { method, segments, query, headers: req.headers, body, rawBody: req.body, params: matched.params, origin };
+  let result: Resp | Promise<Resp>;
+  try {
+    result = matched.handler(ctx, store);
+  } catch (err) {
+    return buildErrorResponse(err);
+  }
+  if (result instanceof Promise) {
+    try {
+      return buildResponse(await result);
+    } catch (err) {
+      return buildErrorResponse(err);
+    }
+  }
+  return buildResponse(result);
+}
+
+// -- connection handling -------------------------------------------------------
+
+/**
+ * Serve one socket: read bytes, parse requests in order, dispatch each and
+ * write its response, then keep the socket for the next request (HTTP/1.1
+ * keep-alive) until the client closes it or asks to close.
+ */
+function handleSocket(socket: Socket, store: Store, router: Router): void {
+  // Disable Nagle: the bench is small request/response pairs, and a Nagle'd
+  // socket holds a small response up to the ~40ms delayed-ACK timer waiting
+  // for an ACK, which Node's http server avoids by setting this itself.
+  socket.setNoDelay(true);
+  let buf = Buffer.alloc(0);
+  let processing = false;
+  let closed = false;
+  /** True once this request's 100 Continue has been sent (reset per request). */
+  let continueSent = false;
+
+  const fail = (message: string): void => {
+    if (closed) return;
+    closed = true;
+    try {
+      socket.write(buildResponse({ status: 400, body: { message } }));
+    } catch {
+      // The socket is already gone; nothing more to do.
+    }
+    socket.destroy();
+  };
+
+  const pump = async (): Promise<void> => {
+    if (processing) return;
+    processing = true;
+    try {
+      for (;;) {
+        if (closed || buf.length === 0) return;
+        const parsed = parseRequest(buf, 0, continueSent);
+        if (parsed.kind === 'need-more') return;
+        if (parsed.kind === 'continue') {
+          continueSent = true;
+          socket.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'utf8'));
+          return;
+        }
+        if (parsed.kind === 'error') {
+          fail(parsed.message);
+          return;
+        }
+        const { req, next } = parsed;
+        continueSent = false;
+        const response = await dispatch(req, store, router);
+        buf = buf.subarray(next);
+        if (closed) return;
+        socket.write(response);
+        if (!req.keepAlive) {
+          closed = true;
+          socket.end();
+          return;
+        }
+      }
+    } finally {
+      processing = false;
+    }
+  };
+
+  socket.on('data', (chunk: Buffer) => {
+    if (closed) return;
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    void pump();
+  });
+  socket.on('error', () => {
+    closed = true;
+    socket.destroy();
+  });
+  socket.on('close', () => {
+    closed = true;
+  });
+}
+
+/** Build a net.Server from a store + router. */
 export function createHttpServer(store: Store, router: Router): Server {
-  return createServer(createRequestHandler(store, router));
+  const server = createNetServer((socket) => handleSocket(socket, store, router));
+  return server;
 }
 
 export { errJson };
