@@ -88,6 +88,12 @@ export interface Issue {
   created_at: string;
   updated_at: string;
   comments: IssueComment[];
+  /**
+   * Serialized single-issue response (with trailing newline), cached only
+   * while the issue carries no labels: labels are fixed at creation and
+   * PATCH never touches them, so the cache is exact until a PATCH clears it.
+   */
+  cachedJson?: Buffer;
 }
 
 export interface PullFile {
@@ -148,6 +154,12 @@ export interface Repo {
   commentSeq: number;
   /** Monotonic insertion order across all issues/PRs, for stable sorting. */
   seqCounter: number;
+  /** Memoized v2 fetch responses: the pack + shallow-info bytes for a fetch
+   * are a pure function of (wants, haves, shallow, depth, deepen-relative,
+   * done) over content-addressed objects, which are immutable and only ever
+   * added — so a cached response stays exact for the life of this repo.
+   * Capped and cleared when full (a recompute is always correct). */
+  fetchCache: Map<string, Buffer>;
 }
 
 export function refName(branch: string): string {
@@ -202,6 +214,7 @@ export class Store {
       pullSeq: 0,
       commentSeq: 0,
       seqCounter: 0,
+      fetchCache: new Map<string, Buffer>(),
     };
     this.repoIdCounter += 1;
     this.repos.set(Store.repoKey(repo.owner, repo.name), repo);

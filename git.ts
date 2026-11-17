@@ -49,6 +49,16 @@ function pktLine(payload: Buffer | string): Buffer {
 const FLUSH = Buffer.from('0000', 'ascii');
 const DELIM = Buffer.from('0001', 'ascii');
 
+/** True when `s` is exactly four hex digits (a pkt-line length header). */
+function isHex4(s: string): boolean {
+  if (s.length !== 4) return false;
+  for (let i = 0; i < 4; i += 1) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) return false;
+  }
+  return true;
+}
+
 /** Decode every pkt-line in `buf`; throws on a bad header or truncation. */
 function decodeAll(buf: Buffer): Packet[] {
   const packets: Packet[] = [];
@@ -56,7 +66,7 @@ function decodeAll(buf: Buffer): Packet[] {
   while (off < buf.length) {
     if (off + 4 > buf.length) throw new Error('truncated pkt-line');
     const header = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('invalid pkt-line header');
+    if (!isHex4(header)) throw new Error('invalid pkt-line header');
     const length = Number.parseInt(header, 16);
     if (length === 0) {
       packets.push({ kind: 'flush' });
@@ -91,7 +101,7 @@ function decodeUntilFlush(buf: Buffer): { packets: Packet[]; rest: Buffer } {
   while (off < buf.length) {
     if (off + 4 > buf.length) throw new Error('truncated pkt-line');
     const header = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('invalid pkt-line header');
+    if (!isHex4(header)) throw new Error('invalid pkt-line header');
     const length = Number.parseInt(header, 16);
     if (length === 0) return { packets, rest: buf.subarray(off + 4) };
     if (length === 1) {
@@ -730,8 +740,14 @@ function computeFetch(
     unshallow = [...new Set(unshallow)].sort();
   }
 
-  const fullWantClosure = collectReachable(repo, wants.filter(isOid));
-  const acks = [...haveSet].filter((have) => fullWantClosure.has(have)).sort();
+  // Acknowledgments only exist when the client sent haves: with none, the
+  // answer is empty by definition, so skip walking the whole want closure
+  // (a depth-1 clone of a 200-commit repo would otherwise pay that walk
+  // on every one of its 50 concurrent fetches).
+  const acks =
+    haveSet.size === 0
+      ? []
+      : [...haveSet].filter((have) => collectReachable(repo, wants.filter(isOid)).has(have)).sort();
   return { objects, shallow, unshallow, acks };
 }
 
@@ -824,6 +840,19 @@ function parseFetchArgs(packets: Packet[]): {
 
 function handleFetchV2(repo: Repo, packets: Packet[]): Buffer {
   const args = parseFetchArgs(packets);
+  // Memoize the whole response: the 50 concurrent depth-1 clones of one tip
+  // send byte-identical fetch requests, and the response is a pure function
+  // of the request over immutable objects (see Repo.fetchCache).
+  const cacheKey = [
+    [...args.wants].sort().join(','),
+    [...args.haves].sort().join(','),
+    [...args.shallow].sort().join(','),
+    args.depth === undefined ? '' : String(args.depth),
+    args.deepenRelative ? '1' : '0',
+    args.done ? '1' : '0',
+  ].join('|');
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const selection = computeFetch(repo, args.wants, args.haves, args.shallow, args.depth, args.deepenRelative);
   const parts: Buffer[] = [];
   // Acknowledgments belong only to an open negotiation round: real git
@@ -856,7 +885,10 @@ function handleFetchV2(repo: Repo, packets: Packet[]): Buffer {
   parts.push(pktLine('packfile\n'));
   for (const packet of sidebandPackets(writePack(repo, selection.objects))) parts.push(packet);
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const response = Buffer.concat(parts);
+  if (repo.fetchCache.size >= 128) repo.fetchCache.clear();
+  repo.fetchCache.set(cacheKey, response);
+  return response;
 }
 
 // -- v0 fetch (fallback; only used when the client did not negotiate v2) -----

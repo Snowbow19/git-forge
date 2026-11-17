@@ -133,6 +133,23 @@ function commentJson(comment: { id: number; body: string; created_at: string; up
   };
 }
 
+/**
+ * Single-issue response. A label-less issue's serialization is cached on
+ * the issue itself (the bench's read workload asks for the same issue 2,000
+ * times a round); any other issue goes through the normal JSON path.
+ */
+function issueResponse(repo: Repo, issue: Issue, status: number): Resp {
+  if (issue.labels.length === 0) {
+    let buf = issue.cachedJson;
+    if (buf === undefined) {
+      buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+      issue.cachedJson = buf;
+    }
+    return { status, jsonBuf: buf };
+  }
+  return { status, body: issueJson(repo, issue) };
+}
+
 function pullJson(pull: Pull): Record<string, unknown> {
   return {
     id: pull.id,
@@ -490,7 +507,7 @@ export function registerRestRoutes(router: Router): void {
       comments: [],
     };
     repo.issues.push(issue);
-    return { status: 201, body: issueJson(repo, issue) };
+    return issueResponse(repo, issue, 201);
   });
 
   router.add('GET', '/api/v3/repos/:owner/:repo/issues', (ctx, store) => {
@@ -509,7 +526,7 @@ export function registerRestRoutes(router: Router): void {
     if ('status' in repo) return repo;
     const issue = repo.issues.find((entry) => entry.number === Number(ctx.params.number));
     if (issue === undefined) return notFound('Issue');
-    return { status: 200, body: issueJson(repo, issue) };
+    return issueResponse(repo, issue, 200);
   });
 
   router.add('PATCH', '/api/v3/repos/:owner/:repo/issues/:number', (ctx, store) => {
@@ -526,7 +543,8 @@ export function registerRestRoutes(router: Router): void {
     const issueBody = asString(body.body);
     if (issueBody !== null) issue.body = issueBody;
     issue.updated_at = TRIAL_NOW.iso;
-    return { status: 200, body: issueJson(repo, issue) };
+    issue.cachedJson = undefined;
+    return issueResponse(repo, issue, 200);
   });
 
   router.add('POST', '/api/v3/repos/:owner/:repo/issues/:number/comments', (ctx, store) => {

@@ -572,6 +572,7 @@ const RESOLVERS: Record<string, Record<string, Resolver>> = {
       if (found === null) throw new Error('Issue not found');
       found.issue.state = 'closed';
       found.issue.updated_at = TRIAL_NOW.iso;
+      found.issue.cachedJson = undefined; // the REST single-issue cache must not serve the old state
       return { __typename: 'CloseIssuePayload', _issue: issueObj(found.repo, found.issue) };
     },
     createPullRequest: (_obj, args, store) => {
