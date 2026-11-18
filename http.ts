@@ -144,6 +144,14 @@ export function isAuthenticated(headers: Record<string, string | string[] | unde
 
 export class Router {
   private readonly routes: Route[] = [];
+  /**
+   * Per-first-segment candidate lists, built lazily: a route only ever
+   * matches when its first literal is null (a :param/:rest first segment)
+   * or equals the path's first segment, so filtering once per distinct
+   * first segment keeps the scan exact (registration order preserved)
+   * while a git path checks 3 routes instead of all 33.
+   */
+  private readonly index = new Map<string, Route[]>();
 
   add(method: string, pattern: string, handler: Handler): void {
     const segments = compilePattern(pattern);
@@ -159,7 +167,15 @@ export class Router {
   }
 
   match(method: string, segments: string[]): { handler: Handler; params: Record<string, string> } | null {
-    for (const route of this.routes) {
+    const first = segments[0] ?? '';
+    let candidates = this.index.get(first);
+    if (candidates === undefined) {
+      candidates = this.routes.filter(
+        (route) => route.firstLiteral === null || route.firstLiteral === first,
+      );
+      this.index.set(first, candidates);
+    }
+    for (const route of candidates) {
       if (route.method !== method) continue;
       // Cheap pre-filters before the per-segment walk (and its params
       // allocation): segment count, then the first literal segment.
@@ -239,7 +255,14 @@ function buildResponse(result: Resp): Buffer {
   head += `x-github-request-id: ${requestId}\r\n`;
   for (const name of Object.keys(headers)) head += `${name}: ${headers[name]}\r\n`;
   head += '\r\n';
-  return body.length === 0 ? Buffer.from(head, 'utf8') : Buffer.concat([Buffer.from(head, 'utf8'), body]);
+  const headBuf = Buffer.from(head, 'utf8');
+  if (body.length === 0) return headBuf;
+  // One allocation for the whole reply instead of one for the head plus a
+  // concat (which allocates again and copies twice).
+  const out = Buffer.allocUnsafe(headBuf.length + body.length);
+  headBuf.copy(out, 0);
+  body.copy(out, headBuf.length);
+  return out;
 }
 
 /** The 500 a handler error answers with (logged, like the old transport). */
@@ -287,9 +310,13 @@ function parseRequest(buf: Buffer, start: number, continueSent: boolean): ParseO
     if (buf.length - start > MAX_HEAD_BYTES) return { kind: 'error', message: 'request head too large' };
     return { kind: 'need-more' };
   }
-  const head = buf.subarray(start, headEnd).toString('latin1');
-  const firstLineEnd = head.indexOf('\r\n');
-  const requestLine = firstLineEnd === -1 ? head : head.slice(0, firstLineEnd);
+  // Parse the head straight off the buffer: converting the whole head to a
+  // string and splitting it allocates a string per head plus an array, on
+  // every request. The request line ends at the first CRLF (which is at
+  // most headEnd, the start of the blank line); header lines run from there
+  // to headEnd. Behaviour is identical to the old whole-head parse.
+  const firstLineEnd = buf.indexOf('\r\n', start);
+  const requestLine = buf.subarray(start, firstLineEnd === -1 ? headEnd : firstLineEnd).toString('latin1');
   const parts = requestLine.split(' ');
   if (parts.length !== 3) return { kind: 'error', message: 'bad request line' };
   const method = parts[0]!;
@@ -300,9 +327,13 @@ function parseRequest(buf: Buffer, start: number, continueSent: boolean): ParseO
   }
   const http11 = version === 'HTTP/1.1';
   const headers: Record<string, string | undefined> = {};
-  if (firstLineEnd !== -1) {
-    const lines = head.slice(firstLineEnd + 2).split('\r\n');
-    for (const line of lines) {
+  if (firstLineEnd !== -1 && firstLineEnd < headEnd) {
+    let off = firstLineEnd + 2;
+    while (off < headEnd) {
+      let lineEnd = buf.indexOf('\r\n', off);
+      if (lineEnd === -1 || lineEnd > headEnd) lineEnd = headEnd;
+      const line = buf.subarray(off, lineEnd).toString('latin1');
+      off = lineEnd + 2;
       if (line === '') continue;
       const colon = line.indexOf(':');
       if (colon <= 0) return { kind: 'error', message: 'bad header line' };

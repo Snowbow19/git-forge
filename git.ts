@@ -595,6 +595,23 @@ function v0Advertisement(repo: Repo, service: string, caps: string): Buffer {
   return Buffer.concat([pktJoin([`# service=${service}\n`]), FLUSH, pktJoin(refLines), FLUSH]);
 }
 
+/**
+ * Cached v0 advertisement: the response is a pure function of the repo's
+ * refs plus the capability line, so it is keyed by gitVersion (bumped on
+ * every refs mutation) and the caps string. Every push info/refs and every
+ * v0 upload-pack client re-asks the same bytes; the first build per version
+ * pays, the rest are one Map lookup.
+ */
+function v0AdvertisementCached(repo: Repo, service: string, caps: string): Buffer {
+  const key = `${repo.gitVersion}|${caps}`;
+  const cached = repo.v0AdCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = v0Advertisement(repo, service, caps);
+  if (repo.v0AdCache.size >= 16) repo.v0AdCache.clear();
+  repo.v0AdCache.set(key, built);
+  return built;
+}
+
 /** The v2 capability advertisement never changes: build its bytes once and reuse them. */
 const V2_ADVERTISEMENT: Buffer = Buffer.concat([
   pktLine('# service=git-upload-pack\n'),
@@ -829,6 +846,12 @@ function handleLsRefs(repo: Repo, packets: Packet[]): Buffer {
   }
   const matches = (name: string): boolean =>
     prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
+  // The answer is a pure function of the refs plus these flags, so it is
+  // memoized per gitVersion: the 50 concurrent clones of one tip all ask
+  // byte-identical ls-refs, and only the first one pays the build.
+  const cacheKey = `${repo.gitVersion}|${peel ? 1 : 0}${symrefs ? 1 : 0}${unborn ? 1 : 0}|${prefixes.join(',')}`;
+  const cached = repo.lsRefsCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const lines: string[] = [];
   const mainTip = repo.refs.get(MAIN_REF);
   if (matches('HEAD')) {
@@ -847,7 +870,10 @@ function handleLsRefs(repo: Repo, packets: Packet[]): Buffer {
     }
     lines.push(`${line}\n`);
   }
-  return Buffer.concat([pktJoin(lines), FLUSH]);
+  const response = Buffer.concat([pktJoin(lines), FLUSH]);
+  if (repo.lsRefsCache.size >= 64) repo.lsRefsCache.clear();
+  repo.lsRefsCache.set(cacheKey, response);
+  return response;
 }
 
 function parseFetchArgs(packets: Packet[]): {
@@ -893,21 +919,16 @@ function parseFetchArgs(packets: Packet[]): {
   return { wants, haves, shallow, depth, done, deepenRelative };
 }
 
-function handleFetchV2(repo: Repo, packets: Packet[]): Buffer {
-  const args = parseFetchArgs(packets);
-  // Memoize the whole response: the 50 concurrent depth-1 clones of one tip
-  // send byte-identical fetch requests, and the response is a pure function
-  // of the request over immutable objects (see Repo.fetchCache).
-  const cacheKey = [
-    [...args.wants].sort().join(','),
-    [...args.haves].sort().join(','),
-    [...args.shallow].sort().join(','),
-    args.depth === undefined ? '' : String(args.depth),
-    args.deepenRelative ? '1' : '0',
-    args.done ? '1' : '0',
-  ].join('|');
-  const cached = repo.fetchCache.get(cacheKey);
+function handleFetchV2(repo: Repo, packets: Packet[], rawBody: Buffer): Buffer {
+  // Fast path: the 50 concurrent depth-1 clones of one tip send
+  // byte-identical fetch requests, and the response is a pure function of
+  // the request over immutable objects (see Repo.fetchCache) — so the raw
+  // request bytes are a safe cache key, and a hit skips the per-line parse
+  // entirely. A miss falls through to the parsed-args computation below.
+  const rawKey = rawBody.toString('latin1');
+  const cached = repo.fetchCache.get(rawKey);
   if (cached !== undefined) return cached;
+  const args = parseFetchArgs(packets);
   const selection = computeFetch(repo, args.wants, args.haves, args.shallow, args.depth, args.deepenRelative);
   const parts: Buffer[] = [];
   // Acknowledgments belong only to an open negotiation round: real git
@@ -946,7 +967,7 @@ function handleFetchV2(repo: Repo, packets: Packet[]): Buffer {
   // Buffer, so every repeat (the 50 concurrent clones) is one write.
   const response = Buffer.concat(parts);
   if (repo.fetchCache.size >= 128) repo.fetchCache.clear();
-  repo.fetchCache.set(cacheKey, response);
+  repo.fetchCache.set(rawKey, response);
   return response;
 }
 
@@ -1045,6 +1066,7 @@ function applyCommand(
     }
     repo.refs.delete(command.ref);
     repo.contents.delete(command.ref);
+    repo.gitVersion += 1;
     repo.updated_at = TRIAL_NOW.iso;
     repo.pushed_at = TRIAL_NOW.iso;
     return { ref: command.ref, ok: true, reason: '' };
@@ -1055,6 +1077,7 @@ function applyCommand(
   if (command.oldOid === ZERO_OID) {
     if (current !== undefined) return { ref: command.ref, ok: false, reason: 'already exists' };
     repo.refs.set(command.ref, command.newOid);
+    repo.gitVersion += 1;
     updateContents(store, repo, command.ref, command.newOid);
     return { ref: command.ref, ok: true, reason: '' };
   }
@@ -1064,6 +1087,7 @@ function applyCommand(
     return { ref: command.ref, ok: false, reason: 'non-fast-forward' };
   }
   repo.refs.set(command.ref, command.newOid);
+  repo.gitVersion += 1;
   updateContents(store, repo, command.ref, command.newOid);
   return { ref: command.ref, ok: true, reason: '' };
 }
@@ -1170,7 +1194,7 @@ function handleInfoRefs(ctx: Ctx, store: Store): Resp {
   if (service === 'git-upload-pack') {
     return {
       status: 200,
-      raw: v0Advertisement(
+      raw: v0AdvertisementCached(
         repo,
         service,
         'side-band-64k shallow ofs-delta thin-pack symref=HEAD:refs/heads/main agent=makefun-git-forge/1.0',
@@ -1180,7 +1204,7 @@ function handleInfoRefs(ctx: Ctx, store: Store): Resp {
   }
   return {
     status: 200,
-    raw: v0Advertisement(
+    raw: v0AdvertisementCached(
       repo,
       service,
       'report-status report-status-v2 side-band-64k delete-refs ofs-delta symref=HEAD:refs/heads/main agent=makefun-git-forge/1.0',
@@ -1213,7 +1237,7 @@ function handleUploadPack(ctx: Ctx, store: Store): Resp {
       if (firstLine.startsWith('command=fetch')) {
         return {
           status: 200,
-          raw: handleFetchV2(repo, packets),
+          raw: handleFetchV2(repo, packets, ctx.rawBody),
           headers: { 'content-type': 'application/x-git-upload-pack-result' },
         };
       }

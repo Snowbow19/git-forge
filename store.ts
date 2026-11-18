@@ -160,6 +160,16 @@ export interface Repo {
    * added — so a cached response stays exact for the life of this repo.
    * Capped and cleared when full (a recompute is always correct). */
   fetchCache: Map<string, Buffer>;
+  /**
+   * Memoized v0 advertisements and ls-refs answers. Both are pure functions
+   * of the repo's refs, so they are keyed by gitVersion, which is bumped on
+   * every refs mutation (applyCommand, commitChanges, createRef). A stale
+   * entry can never be served: the version in its key no longer matches.
+   */
+  lsRefsCache: Map<string, Buffer>;
+  v0AdCache: Map<string, Buffer>;
+  /** Bumped on every refs mutation; see lsRefsCache / v0AdCache. */
+  gitVersion: number;
 }
 
 export function refName(branch: string): string {
@@ -215,6 +225,9 @@ export class Store {
       commentSeq: 0,
       seqCounter: 0,
       fetchCache: new Map<string, Buffer>(),
+      lsRefsCache: new Map<string, Buffer>(),
+      v0AdCache: new Map<string, Buffer>(),
+      gitVersion: 0,
     };
     this.repoIdCounter += 1;
     this.repos.set(Store.repoKey(repo.owner, repo.name), repo);
@@ -369,6 +382,7 @@ export class Store {
     const commitSha = this.storeObject(repo, 'commit', body);
     repo.refs.set(ref, commitSha);
     repo.contents.set(ref, next);
+    repo.gitVersion += 1;
     repo.updated_at = TRIAL_NOW.iso;
     repo.pushed_at = TRIAL_NOW.iso;
     return commitSha;
@@ -383,6 +397,7 @@ export class Store {
     if (!/^[0-9a-f]{40}$/.test(treeSha)) return false;
     repo.refs.set(ref, commitSha);
     repo.contents.set(ref, this.treeToContents(repo, treeSha));
+    repo.gitVersion += 1;
     return true;
   }
 
